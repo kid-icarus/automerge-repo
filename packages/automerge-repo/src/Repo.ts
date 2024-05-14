@@ -43,7 +43,7 @@ export class Repo extends EventEmitter<RepoEvents> {
   /** @hidden */
   saveDebounceRate = 100
 
-  #handleCache: Record<DocumentId, DocHandle<any>> = {}
+  #handleCache: Record<DocumentId, WeakRef<DocHandle<any>>> = {}
 
   #synchronizer: CollectionSynchronizer
 
@@ -212,13 +212,13 @@ export class Repo extends EventEmitter<RepoEvents> {
         return
       }
 
-      const heads = handle.getRemoteHeads(storageId)
+      const heads = handle.deref()?.getRemoteHeads(storageId)
       const haveHeadsChanged =
         message.syncState.theirHeads &&
         (!heads || !headsAreSame(heads, message.syncState.theirHeads))
 
       if (haveHeadsChanged && message.syncState.theirHeads) {
-        handle.setRemoteHeads(storageId, message.syncState.theirHeads)
+        handle.deref()?.setRemoteHeads(storageId, message.syncState.theirHeads)
 
         if (storageId && this.#remoteHeadsGossipingEnabled) {
           this.#remoteHeadsSubscriptions.handleImmediateRemoteHeadsChanged(
@@ -259,7 +259,7 @@ export class Repo extends EventEmitter<RepoEvents> {
 
       this.#remoteHeadsSubscriptions.on("remote-heads-changed", message => {
         const handle = this.#handleCache[message.documentId]
-        handle.setRemoteHeads(message.storageId, message.remoteHeads)
+        handle.deref()?.setRemoteHeads(message.storageId, message.remoteHeads)
       })
     }
   }
@@ -333,12 +333,12 @@ export class Repo extends EventEmitter<RepoEvents> {
     initialValue?: T
   }) {
     // If we have the handle cached, return it
-    if (this.#handleCache[documentId]) return this.#handleCache[documentId]
+    if (this.#handleCache[documentId]) return this.#handleCache[documentId].deref()
 
     // If not, create a new handle, cache it, and return it
     if (!documentId) throw new Error(`Invalid documentId ${documentId}`)
     const handle = new DocHandle<T>(documentId, { isNew, initialValue })
-    this.#handleCache[documentId] = handle
+    this.#handleCache[documentId] = new WeakRef(handle)
     return handle
   }
 
@@ -423,15 +423,15 @@ export class Repo extends EventEmitter<RepoEvents> {
 
     // If we have the handle cached, return it
     if (this.#handleCache[documentId]) {
-      if (this.#handleCache[documentId].isUnavailable()) {
+      if (this.#handleCache[documentId].deref()?.isUnavailable()) {
         // this ensures that the event fires after the handle has been returned
         setTimeout(() => {
-          this.#handleCache[documentId].emit("unavailable", {
-            handle: this.#handleCache[documentId],
+          this.#handleCache[documentId].deref()?.emit("unavailable", {
+            handle: this.#handleCache[documentId].deref() as DocHandle<T>,
           })
         })
       }
-      return this.#handleCache[documentId]
+      return this.#handleCache[documentId].deref() as DocHandle<T>
     }
 
     const handle = this.#getHandle<T>({
@@ -449,7 +449,7 @@ export class Repo extends EventEmitter<RepoEvents> {
     const documentId = interpretAsDocumentId(id)
 
     const handle = this.#getHandle({ documentId, isNew: false })
-    handle.delete()
+    handle?.delete()
 
     delete this.#handleCache[documentId]
     this.emit("delete-document", { documentId })
@@ -466,7 +466,7 @@ export class Repo extends EventEmitter<RepoEvents> {
     const documentId = interpretAsDocumentId(id)
 
     const handle = this.#getHandle({ documentId, isNew: false })
-    const doc = await handle.doc()
+    const doc = await handle?.doc()
     if (!doc) return undefined
     return Automerge.save(doc)
   }
@@ -518,10 +518,13 @@ export class Repo extends EventEmitter<RepoEvents> {
       return Promise.resolve()
     }
     const handles = documents
-      ? documents.map(id => this.#handleCache[id])
-      : Object.values(this.#handleCache)
+      ? documents.map(id => this.#handleCache[id].deref())
+      : Object.values(this.#handleCache).map(ref => ref.deref())
     return Promise.all(
       handles.map(async handle => {
+        if (!handle) {
+          return
+        }
         const doc = handle.docSync()
         if (!doc) {
           return
